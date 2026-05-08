@@ -9,7 +9,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 import os
 from typing import Iterable
-
+import requests
 import pandas as pd
 import streamlit as st
 
@@ -66,12 +66,39 @@ def env_value(key: str, default: str = "") -> str:
 
 
 ROLE_META = {
-    "TOP": {"label": "탑", "icon": "⬟", "class": "role-top"},
-    "JG": {"label": "정글", "icon": "◆", "class": "role-jg"},
-    "MID": {"label": "미드", "icon": "✦", "class": "role-mid"},
-    "ADC": {"label": "원딜", "icon": "◈", "class": "role-adc"},
-    "SUP": {"label": "서폿", "icon": "✚", "class": "role-sup"},
+    "TOP": {
+        "label": "탑",
+        "icon_url": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/svg/position-top.svg",
+        "class": "role-top",
+    },
+    "JG": {
+        "label": "정글",
+        "icon_url": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/svg/position-jungle.svg",
+        "class": "role-jg",
+    },
+    "MID": {
+        "label": "미드",
+        "icon_url": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/svg/position-middle.svg",
+        "class": "role-mid",
+    },
+    "ADC": {
+        "label": "원딜",
+        "icon_url": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/svg/position-bottom.svg",
+        "class": "role-adc",
+    },
+    "SUP": {
+        "label": "서폿",
+        "icon_url": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default/svg/position-utility.svg",
+        "class": "role-sup",
+    },
 }
+
+def role_icon_html(role: str) -> str:
+    meta = ROLE_META.get(role, {})
+    icon_url = meta.get("icon_url", "")
+    if not icon_url:
+        return ""
+    return f'<img class="role-icon-img" src="{e(icon_url)}" alt="{e(role)}" />'
 
 
 @st.cache_resource
@@ -363,6 +390,30 @@ def inject_css() -> None:
             color:#cfe1ff; font-size:.68rem; font-weight:800;
         }
         .champ-pill.empty { color:#8794bb; background:rgba(255,255,255,.035); border-color:rgba(255,255,255,.055); }
+        .slot-champs {
+            display:flex;
+            gap:.35rem;
+            flex-wrap:nowrap;
+            margin-top:.32rem;
+        }
+        
+        .champ-portrait {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+            overflow: hidden;
+            flex: 0 0 auto;
+            border: 1px solid rgba(90,167,255,.24);
+            background: rgba(255,255,255,.05);
+            box-shadow: 0 4px 10px rgba(0,0,0,.18);
+        }
+        
+        .champ-portrait img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
         .slot-rating { text-align:right; font-weight:950; color:#f7faff; }
         .slot-rating small { display:block; color:#8b96ba; font-size:.66rem; font-weight:700; }
         .status-pill { padding:.22rem .38rem; font-size:.68rem; }
@@ -390,7 +441,15 @@ def inject_css() -> None:
         .mvp-grid { display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap:.55rem; margin-top:.7rem; }
         .mvp-card { border-radius: 18px; padding:.72rem .62rem; background:rgba(8,14,28,.75); border:1px solid rgba(122,145,255,.16); text-align:center; }
         .mvp-card .name { color:#f3f6ff; font-weight:900; font-size:.86rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .mvp-card .role { color:#9aa6c7; font-size:.72rem; margin-top:.12rem; }
+        .mvp-card .role {
+            color:#9aa6c7;
+            font-size:.72rem;
+            margin-top:.12rem;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            gap:.25rem;
+        }
         .change-grid { display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap:.55rem; }
         .change-card { border-radius:17px; padding:.62rem; background:rgba(8,14,28,.75); border:1px solid rgba(122,145,255,.14); }
         .change-role { font-weight:950; color:#f4f7ff; margin-bottom:.45rem; }
@@ -569,6 +628,32 @@ def inject_css() -> None:
                 grid-template-columns: repeat(2, minmax(0,1fr));
             }
         }
+        .role-icon-img {
+            width: 15px;
+            height: 15px;
+            object-fit: contain;
+            display: inline-block;
+            flex: 0 0 auto;
+            filter: drop-shadow(0 0 4px rgba(140, 170, 255, .35));
+        }
+        
+        .slot-role {
+            display:flex;
+            align-items:center;
+            gap:.38rem;
+            font-size:.76rem;
+            color:#cbd6ff;
+            font-weight:900;
+        }
+        
+        .slot-summoner {
+            color:#8f9bc0;
+            font-size:.76rem;
+            margin-top:.12rem;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+        }
         </style>
         """
     )
@@ -654,10 +739,10 @@ def metric_cards(metrics: list[tuple[str, str, str]]) -> str:
 def role_chip(role: str, rating: float | None = None) -> str:
     meta = ROLE_META[role]
     if rating is None:
-        return f'<span class="role-chip {meta["class"]}">{meta["icon"]} {role}</span>'
+        return f'<span class="role-chip {meta["class"]}">{role_icon_html(role)} {role}</span>'
     return (
         f'<span class="role-chip {meta["class"]}">'
-        f'<span>{meta["icon"]}</span><span>{role}</span> <b class="{rating_color_class(rating)}">{rating:.0f}</b>'
+        f'<span>{role_icon_html(role)}</span><span>{role}</span> <b class="{rating_color_class(rating)}">{rating:.0f}</b>'
         f'</span>'
     )
 
@@ -831,6 +916,80 @@ def render_player_pool_sort_controls() -> tuple[str, bool]:
 
     return _pool_sort_state()
 
+@st.cache_data(ttl=60 * 60 * 24)
+def get_ddragon_version() -> str:
+    try:
+        response = requests.get(
+            "https://ddragon.leagueoflegends.com/api/versions.json",
+            timeout=5,
+        )
+        response.raise_for_status()
+        versions = response.json()
+        if versions:
+            return str(versions[0])
+    except Exception:
+        pass
+    return "15.1.1"  # fallback
+        
+
+FALLBACK_CHAMPION_IDS = {
+    "가렌": "Garen",
+    "녹턴": "Nocturne",
+    "말자하": "Malzahar",
+    "멜": "Mel",
+    "벨코즈": "Velkoz",
+    "블라디미르": "Vladimir",
+    "시비르": "Sivir",
+    "아트록스": "Aatrox",
+    "애쉬": "Ashe",
+    "자야": "Xayah",
+    "카시오페아": "Cassiopeia",
+    "하이머딩거": "Heimerdinger",
+}
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_champion_id_map() -> dict[str, str]:
+    version = get_ddragon_version()
+    mapping = dict(FALLBACK_CHAMPION_IDS)
+    try:
+        for locale in ("ko_KR", "en_US"):
+            response = requests.get(
+                f"https://ddragon.leagueoflegends.com/cdn/{version}/data/{locale}/champion.json",
+                timeout=5,
+            )
+            response.raise_for_status()
+            champions = response.json().get("data", {})
+            for champion_id, payload in champions.items():
+                names = {
+                    champion_id,
+                    str(payload.get("id") or ""),
+                    str(payload.get("key") or ""),
+                    str(payload.get("name") or ""),
+                }
+                for name in names:
+                    if name.strip():
+                        mapping[name.strip()] = champion_id
+                        mapping[name.strip().casefold()] = champion_id
+    except Exception:
+        pass
+    return mapping
+
+
+def champion_image_id(champion: str) -> str:
+    champion = str(champion or "").strip()
+    if not champion:
+        return ""
+    mapping = get_champion_id_map()
+    return mapping.get(champion) or mapping.get(champion.casefold()) or champion
+
+
+def champion_portrait_url(champion: str) -> str:
+    champion = str(champion or "").strip()
+    if not champion:
+        return ""
+    version = get_ddragon_version()
+    return f"https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{champion_image_id(champion)}.png"
 
 def render_player_pool(
     players,
@@ -922,15 +1081,31 @@ def render_player_pool(
 def champion_pills_html(player, role: str) -> str:
     picks = (getattr(player, "lane_champions", {}) or {}).get(role, [])[:3]
     if not picks:
-        return '<span class="champ-pill empty">Most 기록 없음</span>'
+        return '<span class="champ-pill empty">기록 없음</span>'
 
-    pills = []
+    portraits = []
     for item in picks:
         champion = item.get("champion", "") if isinstance(item, dict) else str(item)
         games = item.get("games", 0) if isinstance(item, dict) else 0
-        label = f"{champion} {games}판" if games else champion
-        pills.append(f'<span class="champ-pill">{e(label)}</span>')
-    return "".join(pills)
+
+        if not champion:
+            continue
+
+        img_url = champion_portrait_url(champion)
+        tooltip = f"{champion} {games}판" if games else champion
+
+        portraits.append(
+            f'''
+            <div class="champ-portrait" title="{e(tooltip)}">
+                <img src="{e(img_url)}" alt="{e(champion)}" />
+            </div>
+            '''
+        )
+
+    if not portraits:
+        return '<span class="champ-pill empty">기록 없음</span>'
+
+    return "".join(portraits)
 
 
 def team_card_html(assignment) -> str:
@@ -950,10 +1125,10 @@ def team_card_html(assignment) -> str:
         rows.append(
             f"""
             <div class="slot-row">
-                <div class="slot-role"><span>{meta['icon']}</span><span>{role}</span></div>
+                <div class="slot-role">{role_icon_html(role)}<span>{role}</span></div>
                 <div>
                     <div class="slot-player">{e(p.label_name)}</div>
-                    <div class="slot-tier">{e(p.name)} · {e(meta['label'])} · {e(tier)} · 선호 {', '.join(p.preferred_roles) if p.preferred_roles else '상관없음'}</div>
+                    <div class="slot-summoner">{e(p.name)}</div>
                     <div class="slot-champs">{champ_pills}</div>
                 </div>
                 <div class="slot-rating"><span class="{rating_color_class(rating)}">{rating:.1f}</span><small>{e(tier)}</small></div>
@@ -1027,7 +1202,7 @@ def roster_compact_html(assignment, title: str) -> str:
         rows.append(
             f"""
             <div class="slot-row" style="grid-template-columns:70px 1fr 72px; min-height:52px;">
-                <div class="slot-role">{ROLE_META[role]['icon']} {role}</div>
+                <div class="slot-role">{role_icon_html(role)}<span>{role}</span></div>
                 <div><div class="slot-player">{e(p.label_name)}</div><div class="slot-tier">{e(p.name)}</div></div>
                 <div class="slot-rating"><span class="{rating_color_class(p.rating_for(role))}">{p.rating_for(role):.0f}</span></div>
             </div>
@@ -1050,7 +1225,7 @@ def mvp_preview_html(assignment) -> str:
             <div class="mvp-card">
                 <div class="avatar" style="margin:0 auto .45rem;">{e(p.label_name[:1])}</div>
                 <div class="name">{e(p.label_name)}</div>
-                <div class="role">{ROLE_META[role]['icon']} {role} · {p.rating_for(role):.0f}</div>
+                <div class="role">{role_icon_html(role)}<span>{role}</span> · {p.rating_for(role):.0f}</div>
             </div>
             """
         )
@@ -1085,7 +1260,7 @@ def change_preview_html(changes) -> str:
         role_cards.append(
             f"""
             <div class="change-card">
-                <div class="change-role">{ROLE_META[role]['icon']} {role}</div>
+                <div class="change-role">{role_icon_html(role)}<span>{role}</span></div>
                 {''.join(rows)}
             </div>
             """
@@ -1101,7 +1276,7 @@ def role_bars_html(player) -> str:
         rows.append(
             f"""
             <div class="role-bar-row">
-                <div class="role-bar-label">{ROLE_META[role]['icon']} {role}</div>
+                <div class="role-bar-label">{role_icon_html(role)}<span>{role}</span></div>
                 <div class="role-bar-track"><div class="role-bar-fill" style="width:{fill:.1f}%"></div></div>
                 <div class="role-bar-value"><span class="{rating_color_class(rating)}">{rating:.1f}</span> <span style="color:#8c98bc">{rating_to_tier_label(rating)}</span></div>
             </div>
@@ -1534,12 +1709,14 @@ def render_copy_export_panel(candidate) -> None:
         st.write("")
         st.write("")
         if st.button("📋 복사", use_container_width=True):
-            import pyperclip
-            try:
-                pyperclip.copy(text_value)
-                st.success("클립보드에 복사됨!")
-            except Exception:
-                st.error("복사 실패 (pyperclip 미설치)")
+            st.code(text_value, language="text")
+        
+            # st.download_button(
+            #     label="텍스트 파일로 다운로드",
+            #     data=text_value,
+            #     file_name="team_assignment.txt",
+            #     mime="text/plain",
+            # )
     panel_end()
 
 

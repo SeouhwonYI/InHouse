@@ -297,7 +297,7 @@ def _csv_player_from_row(row: dict[str, str]) -> Player:
         base_rating=base,
         preferred_roles=_json_loads_list(json.dumps(str(row.get("preferred_roles") or "").split("|"))),
         role_ratings=ratings,
-        lane_champions=_json_loads_dict(row.get("top_champions_json")),
+        lane_champions=normalize_top_champions_by_role(row.get("top_champions_json")),
     )
 
 
@@ -483,6 +483,58 @@ def _json_loads_dict(value: str | None) -> dict[str, Any]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def normalize_top_champions_by_role(value: Any) -> dict[str, list[dict[str, Any]]]:
+    """Normalize champion pools from Riot sync or hand-authored CSV input.
+
+    Accepted shapes:
+      {"ADC": [{"champion": "Sivir", "games": 4}]}
+      {"ADC": ["Sivir", "Xayah", "Ashe"]}
+
+    Empty champion names are ignored, and only known app roles are kept.
+    """
+    if value is None:
+        return {role: [] for role in ROLES}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {role: [] for role in ROLES}
+        try:
+            value = json.loads(text)
+        except Exception:  # noqa: BLE001
+            return {role: [] for role in ROLES}
+    if not isinstance(value, dict):
+        return {role: [] for role in ROLES}
+
+    normalized: dict[str, list[dict[str, Any]]] = {role: [] for role in ROLES}
+    for raw_role, raw_items in value.items():
+        role = str(raw_role or "").strip().upper()
+        if role not in ROLES:
+            continue
+        if isinstance(raw_items, (str, dict)):
+            items = [raw_items]
+        elif isinstance(raw_items, list):
+            items = raw_items
+        else:
+            items = []
+
+        seen: set[str] = set()
+        for item in items:
+            games = 0
+            if isinstance(item, dict):
+                champion = str(item.get("champion") or item.get("name") or "").strip()
+                try:
+                    games = int(float(item.get("games") or 0))
+                except Exception:  # noqa: BLE001
+                    games = 0
+            else:
+                champion = str(item or "").strip()
+            if not champion or champion in seen:
+                continue
+            seen.add(champion)
+            normalized[role].append({"champion": champion, "games": max(0, games)})
+    return normalized
+
+
 def _player_from_row(row: sqlite3.Row, ratings: dict[str, RoleRating]) -> Player:
     return Player(
         id=int(row["id"]),
@@ -499,7 +551,9 @@ def _player_from_row(row: sqlite3.Row, ratings: dict[str, RoleRating]) -> Player
         base_rating=float(row["base_rating"]),
         preferred_roles=_json_loads_list(row["preferred_roles_json"]),
         role_ratings=ratings,
-        lane_champions=_json_loads_dict(row["top_champions_json"] if "top_champions_json" in row.keys() else "{}"),
+        lane_champions=normalize_top_champions_by_role(
+            row["top_champions_json"] if "top_champions_json" in row.keys() else "{}"
+        ),
     )
 
 
@@ -523,6 +577,7 @@ def create_player(
     preferred = [role.upper() for role in preferred_roles if role.upper() in ROLES]
     display_name = (display_name or name).strip()
     base_rating = tier_to_rating(solo_tier, solo_rank, league_points)
+    top_champions_by_role = normalize_top_champions_by_role(top_champions_by_role)
     if role_ratings is None:
         role_ratings = initialize_role_ratings(base_rating, preferred)
 
@@ -550,7 +605,7 @@ def create_player(
                 "flex_league_points": int(flex_league_points),
                 "base_rating": float(base_rating),
                 "preferred_roles": "|".join(preferred),
-                "top_champions_json": json.dumps(top_champions_by_role or {}, ensure_ascii=False),
+                "top_champions_json": json.dumps(top_champions_by_role, ensure_ascii=False),
                 "updated_at": now,
             }
         )
@@ -597,7 +652,7 @@ def create_player(
             int(flex_league_points),
             float(base_rating),
             json.dumps(preferred, ensure_ascii=False),
-            json.dumps(top_champions_by_role or {}, ensure_ascii=False),
+            json.dumps(top_champions_by_role, ensure_ascii=False),
         ),
     )
     player_id = int(cur.fetchone()["id"])
@@ -642,7 +697,7 @@ def update_player_riot_snapshot(
     """Persist Riot-ranked priors and recent lane champion pools for one player."""
     preferred = [role.upper() for role in preferred_roles if role.upper() in ROLES]
     role_priors = role_priors or initialize_role_ratings(base_rating, preferred)
-    champions_json = json.dumps(top_champions_by_role or {}, ensure_ascii=False)
+    champions_json = json.dumps(normalize_top_champions_by_role(top_champions_by_role), ensure_ascii=False)
 
     if is_csv_conn(conn):
         rows = _csv_read_dicts(conn.players_path)

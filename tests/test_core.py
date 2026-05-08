@@ -5,7 +5,14 @@ from inhouse_balancer.constants import ROLES
 from inhouse_balancer.importers import load_csv_rows
 from inhouse_balancer.rating import compute_rating_preview
 from inhouse_balancer.exports import append_match_csv_log
-from inhouse_balancer.storage import connect, create_player, init_db, list_players, record_match_and_update
+from inhouse_balancer.storage import (
+    connect,
+    create_player,
+    init_db,
+    list_players,
+    normalize_top_champions_by_role,
+    record_match_and_update,
+)
 
 
 def make_conn():
@@ -108,6 +115,52 @@ def test_load_csv_rows_accepts_cp949_korean_excel_csv(tmp_path):
     assert rows[0]["name"] == "잘ㅋ멋진놈"
     assert rows[0]["riot_game_name"] == "잘ㅋ멋진놈"
     assert rows[0]["preferred_roles"] == "TOP|JG"
+
+
+def test_normalize_top_champions_accepts_name_lists():
+    pools = normalize_top_champions_by_role(
+        {
+            "TOP": ["Vladimir", "Garen", ""],
+            "ADC": [{"champion": "Sivir", "games": 4}, "Xayah"],
+            "UNKNOWN": ["Ignored"],
+        }
+    )
+
+    assert pools["TOP"] == [
+        {"champion": "Vladimir", "games": 0},
+        {"champion": "Garen", "games": 0},
+    ]
+    assert pools["ADC"] == [
+        {"champion": "Sivir", "games": 4},
+        {"champion": "Xayah", "games": 0},
+    ]
+
+
+def test_import_players_csv_syncs_flex_and_top_champion_lists(tmp_path):
+    conn = connect(":memory:", database_url="")
+    init_db(conn)
+    csv_path = tmp_path / "players.csv"
+    csv_path.write_text(
+        'name,display_name,riot_game_name,riot_tag_line,solo_tier,solo_rank,league_points,flex_tier,flex_rank,flex_league_points,preferred_roles,top_champions_json,TOP,JG,MID,ADC,SUP\n'
+        '"Player#KR1",Alias,Player,KR1,EMERALD,IV,41,EMERALD,I,63,ADC|SUP,"{""TOP"": [""Vladimir"", ""Garen"", """"], ""ADC"": [""Sivir"", ""Xayah"", ""Ashe""]}",63,66,68,69,67\n',
+        encoding="utf-8-sig",
+    )
+
+    from inhouse_balancer.importers import import_players_csv
+
+    report = import_players_csv(conn, csv_path)
+    player = list_players(conn)[0]
+
+    assert report.imported == 1
+    assert player.flex_tier == "EMERALD"
+    assert player.flex_rank == "I"
+    assert player.flex_league_points == 63
+    assert player.preferred_roles == ["ADC", "SUP"]
+    assert player.lane_champions["TOP"][:2] == [
+        {"champion": "Vladimir", "games": 0},
+        {"champion": "Garen", "games": 0},
+    ]
+    assert player.lane_champions["ADC"][2]["champion"] == "Ashe"
 
 
 def test_record_match_can_append_csv_log(tmp_path):

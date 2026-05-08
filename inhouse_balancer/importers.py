@@ -16,7 +16,14 @@ from typing import Any, Iterable
 from .constants import LANE_IMPACT_LABELS, ROLES
 from .models import Player, TeamAssignment
 from .rating import initialize_role_ratings, tier_to_rating
-from .storage import create_player, delete_all_data, list_players, record_match_and_update, update_match_played_at
+from .storage import (
+    create_player,
+    delete_all_data,
+    list_players,
+    normalize_top_champions_by_role,
+    record_match_and_update,
+    update_match_played_at,
+)
 
 
 ROLE_ALIASES: dict[str, str] = {
@@ -282,6 +289,13 @@ def _import_player_rows(conn, rows: list[dict[str, str]], *, source_label: str =
             solo_rank = _get(row, "solo_rank", "rank", "랭크", default="").upper()
             lp_text = _get(row, "league_points", "lp", "LP", default="0") or "0"
             league_points = int(float(lp_text))
+            flex_tier = _get(row, "flex_tier", default="UNRANKED").upper() or "UNRANKED"
+            flex_rank = _get(row, "flex_rank", default="").upper()
+            flex_lp_text = _get(row, "flex_league_points", "flex_lp", default="0") or "0"
+            flex_league_points = int(float(flex_lp_text))
+            top_champions_by_role = normalize_top_champions_by_role(
+                _get(row, "top_champions_json", "lane_champions", "champions", default="")
+            )
 
             solo_rating = tier_to_rating(solo_tier, solo_rank, league_points)
             role_ratings = initialize_role_ratings(solo_rating, preferred_roles)
@@ -299,10 +313,14 @@ def _import_player_rows(conn, rows: list[dict[str, str]], *, source_label: str =
                 solo_tier=solo_tier,
                 solo_rank=solo_rank,
                 league_points=league_points,
+                flex_tier=flex_tier,
+                flex_rank=flex_rank,
+                flex_league_points=flex_league_points,
                 role_ratings=role_ratings if any_explicit_rating else None,
                 display_name=display_name,
                 riot_game_name=riot_game_name,
                 riot_tag_line=riot_tag_line,
+                top_champions_by_role=top_champions_by_role,
             )
             report.imported += 1
         except Exception as exc:  # noqa: BLE001 - report every bad CSV row without aborting the whole import
