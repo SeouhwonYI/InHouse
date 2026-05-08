@@ -54,6 +54,17 @@ class RiotClient:
         )
         self._last_request_ts = time.monotonic()
 
+        if response.status_code == 429:
+            retry_after = float(response.headers.get("Retry-After", "2") or 2)
+            time.sleep(max(1.0, retry_after))
+            response = requests.get(
+                url,
+                params=params or {},
+                headers={"X-Riot-Token": self.api_key},
+                timeout=self.timeout,
+            )
+            self._last_request_ts = time.monotonic()
+
         if response.status_code >= 400:
             raise RiotAPIError(f"{response.status_code} {response.reason}: {response.text[:300]}")
         return response.json()

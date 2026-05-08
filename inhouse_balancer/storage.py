@@ -1,7 +1,8 @@
 """Persistence layer for the in-house balancer.
 
-The app keeps SQLite as a local-development fallback, but production deployments can
-use PostgreSQL by setting DATABASE_URL, e.g.
+The app defaults to a CSV-only store for small private in-house groups.  SQLite is
+still available as a local fallback by setting ``INHOUSE_STORAGE=sqlite``, and
+production deployments can use PostgreSQL by setting DATABASE_URL, e.g.
 
     DATABASE_URL=postgresql://user:password@host:5432/dbname
 
@@ -15,6 +16,7 @@ import json
 import os
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +26,93 @@ from .models import Player, RoleRating, TeamAssignment
 from .rating import clamp, compute_rating_preview, initialize_role_ratings, tier_to_rating
 
 DB_PATH = Path("data/inhouse_balancer.sqlite")
+CSV_DATA_DIR = Path("data/csv")
+
+CSV_PLAYER_COLUMNS = [
+    "id",
+    "name",
+    "display_name",
+    "riot_game_name",
+    "riot_tag_line",
+    "solo_tier",
+    "solo_rank",
+    "league_points",
+    "flex_tier",
+    "flex_rank",
+    "flex_league_points",
+    "base_rating",
+    "preferred_roles",
+    *ROLES,
+    *[f"{role}_games" for role in ROLES],
+    *[f"{role}_confidence" for role in ROLES],
+    "puuid",
+    "summoner_id",
+    "profile_icon_id",
+    "summoner_level",
+    "top_champions_json",
+    "created_at",
+    "updated_at",
+]
+
+CSV_MATCH_COLUMNS = [
+    "id",
+    "played_at",
+    "blue_win",
+    "blue_score",
+    "red_score",
+    "blue_rating_before",
+    "red_rating_before",
+    "expected_blue_win",
+    "carry_player_ids",
+    "mvp_player_id",
+    "lane_impacts",
+    "notes",
+    "created_at",
+]
+
+CSV_PARTICIPANT_COLUMNS = [
+    "match_id",
+    "player_id",
+    "team",
+    "role",
+    "rating_before",
+    "rating_after",
+    "delta",
+    "reason",
+]
+
+
+class CsvStorage:
+    """Small file-backed store used by the app when no DB is configured."""
+
+    is_csv = True
+
+    def __init__(self, data_dir: str | Path = CSV_DATA_DIR):
+        self.data_dir = Path(data_dir)
+        self.players_path = self.data_dir / "players.csv"
+        self.matches_path = self.data_dir / "matches.csv"
+        self.participants_path = self.data_dir / "match_participants.csv"
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def get_match_row(self, match_id: int) -> dict[str, Any] | None:
+        for row in _csv_read_dicts(self.matches_path):
+            if int(row.get("id") or 0) == int(match_id):
+                return row
+        return None
 
 
 class PostgresConnection:
@@ -73,12 +162,16 @@ def is_postgres_conn(conn) -> bool:
     return bool(getattr(conn, "is_postgres", False))
 
 
+def is_csv_conn(conn) -> bool:
+    return bool(getattr(conn, "is_csv", False))
+
+
 def connect(
     db_path: str | Path = DB_PATH,
     *,
     database_url: str | None = None,
 ):
-    """Open either PostgreSQL or SQLite.
+    """Open CSV, PostgreSQL, or SQLite.
 
     `database_url=None` means "read DATABASE_URL from the environment".  Passing an
     empty string disables PostgreSQL and forces SQLite, which is useful for tests and
@@ -101,6 +194,14 @@ def connect(
         raw = psycopg.connect(database_url, row_factory=dict_row, autocommit=False)
         return PostgresConnection(raw)
 
+    if str(db_path) == ":memory:":
+        storage_backend = "sqlite"
+    else:
+        storage_backend = os.getenv("INHOUSE_STORAGE", "csv").strip().lower()
+    if storage_backend in {"csv", "file", "files"}:
+        csv_dir = os.getenv("CSV_DATA_DIR", "").strip()
+        return CsvStorage(csv_dir or CSV_DATA_DIR)
+
     path = Path(db_path)
     if str(path) != ":memory":
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,12 +212,97 @@ def connect(
 
 
 def init_db(conn) -> None:
+    if is_csv_conn(conn):
+        _init_csv_store(conn)
+        return
     if is_postgres_conn(conn):
         _init_postgres_db(conn)
     else:
         _init_sqlite_db(conn)
     ensure_column(conn, "players", "display_name", "TEXT")
+    ensure_column(conn, "players", "flex_tier", "TEXT DEFAULT 'UNRANKED'")
+    ensure_column(conn, "players", "flex_rank", "TEXT DEFAULT ''")
+    ensure_column(conn, "players", "flex_league_points", "INTEGER DEFAULT 0")
+    ensure_column(conn, "players", "top_champions_json", "TEXT NOT NULL DEFAULT '{}'")
     conn.commit()
+
+
+def _now_text() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _csv_read_dicts(path: Path) -> list[dict[str, str]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
+def _csv_write_dicts(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def _csv_append_dict(path: Path, columns: list[str], row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({column: row.get(column, "") for column in columns})
+
+
+def _init_csv_store(conn: CsvStorage) -> None:
+    conn.data_dir.mkdir(parents=True, exist_ok=True)
+    if not conn.players_path.exists():
+        _csv_write_dicts(conn.players_path, CSV_PLAYER_COLUMNS, [])
+    if not conn.matches_path.exists():
+        _csv_write_dicts(conn.matches_path, CSV_MATCH_COLUMNS, [])
+    if not conn.participants_path.exists():
+        _csv_write_dicts(conn.participants_path, CSV_PARTICIPANT_COLUMNS, [])
+
+
+def _csv_next_id(rows: list[dict[str, str]]) -> int:
+    ids = [int(row.get("id") or 0) for row in rows if str(row.get("id") or "").strip()]
+    return (max(ids) + 1) if ids else 1
+
+
+def _csv_player_from_row(row: dict[str, str]) -> Player:
+    ratings: dict[str, RoleRating] = {}
+    base = float(row.get("base_rating") or 50.0)
+    for role in ROLES:
+        ratings[role] = RoleRating(
+            role=role,
+            rating=float(row.get(role) or base),
+            games_played=int(float(row.get(f"{role}_games") or 0)),
+            confidence=float(row.get(f"{role}_confidence") or 0.45),
+        )
+    return Player(
+        id=int(row["id"]) if str(row.get("id") or "").strip() else None,
+        name=str(row.get("name") or ""),
+        display_name=str(row.get("display_name") or "") or None,
+        riot_game_name=str(row.get("riot_game_name") or "") or None,
+        riot_tag_line=str(row.get("riot_tag_line") or "") or None,
+        solo_tier=str(row.get("solo_tier") or "UNRANKED"),
+        solo_rank=str(row.get("solo_rank") or ""),
+        league_points=int(float(row.get("league_points") or 0)),
+        flex_tier=str(row.get("flex_tier") or "UNRANKED"),
+        flex_rank=str(row.get("flex_rank") or ""),
+        flex_league_points=int(float(row.get("flex_league_points") or 0)),
+        base_rating=base,
+        preferred_roles=_json_loads_list(json.dumps(str(row.get("preferred_roles") or "").split("|"))),
+        role_ratings=ratings,
+        lane_champions=_json_loads_dict(row.get("top_champions_json")),
+    )
+
+
+def _csv_players_by_id(conn: CsvStorage) -> dict[int, Player]:
+    return {int(player.id): player for player in list_players(conn) if player.id is not None}
 
 
 def _init_sqlite_db(conn) -> None:
@@ -131,8 +317,12 @@ def _init_sqlite_db(conn) -> None:
             solo_tier TEXT DEFAULT 'UNRANKED',
             solo_rank TEXT DEFAULT '',
             league_points INTEGER DEFAULT 0,
+            flex_tier TEXT DEFAULT 'UNRANKED',
+            flex_rank TEXT DEFAULT '',
+            flex_league_points INTEGER DEFAULT 0,
             base_rating REAL NOT NULL DEFAULT 50.0,
             preferred_roles_json TEXT NOT NULL DEFAULT '[]',
+            top_champions_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -193,8 +383,12 @@ def _init_postgres_db(conn) -> None:
             solo_tier TEXT DEFAULT 'UNRANKED',
             solo_rank TEXT DEFAULT '',
             league_points INTEGER DEFAULT 0,
+            flex_tier TEXT DEFAULT 'UNRANKED',
+            flex_rank TEXT DEFAULT '',
+            flex_league_points INTEGER DEFAULT 0,
             base_rating DOUBLE PRECISION NOT NULL DEFAULT 50.0,
             preferred_roles_json TEXT NOT NULL DEFAULT '[]',
+            top_champions_json TEXT NOT NULL DEFAULT '{}',
             created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
@@ -279,6 +473,16 @@ def _json_loads_list(value: str | None) -> list[str]:
     return [str(x) for x in loaded]
 
 
+def _json_loads_dict(value: str | None) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        loaded = json.loads(value)
+    except Exception:  # noqa: BLE001
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _player_from_row(row: sqlite3.Row, ratings: dict[str, RoleRating]) -> Player:
     return Player(
         id=int(row["id"]),
@@ -289,9 +493,13 @@ def _player_from_row(row: sqlite3.Row, ratings: dict[str, RoleRating]) -> Player
         solo_tier=str(row["solo_tier"] or "UNRANKED"),
         solo_rank=str(row["solo_rank"] or ""),
         league_points=int(row["league_points"] or 0),
+        flex_tier=str(row["flex_tier"] or "UNRANKED") if "flex_tier" in row.keys() else "UNRANKED",
+        flex_rank=str(row["flex_rank"] or "") if "flex_rank" in row.keys() else "",
+        flex_league_points=int(row["flex_league_points"] or 0) if "flex_league_points" in row.keys() else 0,
         base_rating=float(row["base_rating"]),
         preferred_roles=_json_loads_list(row["preferred_roles_json"]),
         role_ratings=ratings,
+        lane_champions=_json_loads_dict(row["top_champions_json"] if "top_champions_json" in row.keys() else "{}"),
     )
 
 
@@ -303,10 +511,14 @@ def create_player(
     solo_tier: str = "UNRANKED",
     solo_rank: str = "",
     league_points: int = 0,
+    flex_tier: str = "UNRANKED",
+    flex_rank: str = "",
+    flex_league_points: int = 0,
     role_ratings: dict[str, float] | None = None,
     display_name: str | None = None,
     riot_game_name: str | None = None,
     riot_tag_line: str | None = None,
+    top_champions_by_role: dict[str, list[dict[str, Any]]] | None = None,
 ) -> int:
     preferred = [role.upper() for role in preferred_roles if role.upper() in ROLES]
     display_name = (display_name or name).strip()
@@ -314,12 +526,48 @@ def create_player(
     if role_ratings is None:
         role_ratings = initialize_role_ratings(base_rating, preferred)
 
+    if is_csv_conn(conn):
+        rows = _csv_read_dicts(conn.players_path)
+        now = _now_text()
+        existing = next((row for row in rows if str(row.get("name") or "") == name), None)
+        if existing is None:
+            existing = {
+                "id": _csv_next_id(rows),
+                "created_at": now,
+            }
+            rows.append(existing)
+        existing.update(
+            {
+                "name": name,
+                "display_name": display_name,
+                "riot_game_name": riot_game_name or "",
+                "riot_tag_line": riot_tag_line or "",
+                "solo_tier": solo_tier.upper(),
+                "solo_rank": solo_rank.upper(),
+                "league_points": int(league_points),
+                "flex_tier": flex_tier.upper(),
+                "flex_rank": flex_rank.upper(),
+                "flex_league_points": int(flex_league_points),
+                "base_rating": float(base_rating),
+                "preferred_roles": "|".join(preferred),
+                "top_champions_json": json.dumps(top_champions_by_role or {}, ensure_ascii=False),
+                "updated_at": now,
+            }
+        )
+        for role in ROLES:
+            existing[role] = float(role_ratings[role])
+            existing.setdefault(f"{role}_games", 0)
+            existing.setdefault(f"{role}_confidence", 0.45)
+        _csv_write_dicts(conn.players_path, CSV_PLAYER_COLUMNS, rows)
+        return int(existing["id"])
+
     cur = conn.execute(
         """
         INSERT INTO players (
             name, display_name, riot_game_name, riot_tag_line, solo_tier, solo_rank,
-            league_points, base_rating, preferred_roles_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            league_points, flex_tier, flex_rank, flex_league_points,
+            base_rating, preferred_roles_json, top_champions_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             display_name = excluded.display_name,
             riot_game_name = excluded.riot_game_name,
@@ -327,8 +575,12 @@ def create_player(
             solo_tier = excluded.solo_tier,
             solo_rank = excluded.solo_rank,
             league_points = excluded.league_points,
+            flex_tier = excluded.flex_tier,
+            flex_rank = excluded.flex_rank,
+            flex_league_points = excluded.flex_league_points,
             base_rating = excluded.base_rating,
             preferred_roles_json = excluded.preferred_roles_json,
+            top_champions_json = excluded.top_champions_json,
             updated_at = CURRENT_TIMESTAMP
         RETURNING id
         """,
@@ -340,8 +592,12 @@ def create_player(
             solo_tier.upper(),
             solo_rank.upper(),
             int(league_points),
+            flex_tier.upper(),
+            flex_rank.upper(),
+            int(flex_league_points),
             float(base_rating),
             json.dumps(preferred, ensure_ascii=False),
+            json.dumps(top_champions_by_role or {}, ensure_ascii=False),
         ),
     )
     player_id = int(cur.fetchone()["id"])
@@ -361,7 +617,128 @@ def create_player(
     return player_id
 
 
+def update_player_riot_snapshot(
+    conn,
+    *,
+    player_id: int,
+    riot_game_name: str,
+    riot_tag_line: str,
+    puuid: str,
+    summoner_id: str | None = None,
+    profile_icon_id: int = 0,
+    summoner_level: int = 0,
+    solo_tier: str = "UNRANKED",
+    solo_rank: str = "",
+    league_points: int = 0,
+    flex_tier: str = "UNRANKED",
+    flex_rank: str = "",
+    flex_league_points: int = 0,
+    base_rating: float = 50.0,
+    preferred_roles: Iterable[str] = (),
+    role_priors: dict[str, float] | None = None,
+    top_champions_by_role: dict[str, list[dict[str, Any]]] | None = None,
+    reset_role_ratings: bool = False,
+) -> None:
+    """Persist Riot-ranked priors and recent lane champion pools for one player."""
+    preferred = [role.upper() for role in preferred_roles if role.upper() in ROLES]
+    role_priors = role_priors or initialize_role_ratings(base_rating, preferred)
+    champions_json = json.dumps(top_champions_by_role or {}, ensure_ascii=False)
+
+    if is_csv_conn(conn):
+        rows = _csv_read_dicts(conn.players_path)
+        target = next((row for row in rows if int(row.get("id") or 0) == int(player_id)), None)
+        if target is None:
+            raise ValueError(f"player_id를 찾을 수 없습니다: {player_id}")
+        target.update(
+            {
+                "riot_game_name": riot_game_name,
+                "riot_tag_line": riot_tag_line,
+                "puuid": puuid,
+                "summoner_id": summoner_id or "",
+                "profile_icon_id": int(profile_icon_id or 0),
+                "summoner_level": int(summoner_level or 0),
+                "solo_tier": solo_tier.upper(),
+                "solo_rank": solo_rank.upper(),
+                "league_points": int(league_points),
+                "flex_tier": flex_tier.upper(),
+                "flex_rank": flex_rank.upper(),
+                "flex_league_points": int(flex_league_points),
+                "base_rating": float(base_rating),
+                "preferred_roles": "|".join(preferred),
+                "top_champions_json": champions_json,
+                "updated_at": _now_text(),
+            }
+        )
+        for role in ROLES:
+            games_played = int(float(target.get(f"{role}_games") or 0))
+            if reset_role_ratings or games_played == 0:
+                target[role] = float(role_priors[role])
+                if reset_role_ratings:
+                    target[f"{role}_games"] = 0
+                    target[f"{role}_confidence"] = 0.45
+        _csv_write_dicts(conn.players_path, CSV_PLAYER_COLUMNS, rows)
+        return
+
+    with conn:
+        conn.execute(
+            """
+            UPDATE players
+            SET riot_game_name = ?, riot_tag_line = ?, puuid = ?, summoner_id = ?,
+                profile_icon_id = ?, summoner_level = ?,
+                solo_tier = ?, solo_rank = ?, league_points = ?,
+                flex_tier = ?, flex_rank = ?, flex_league_points = ?,
+                base_rating = ?, preferred_roles_json = ?, top_champions_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                riot_game_name,
+                riot_tag_line,
+                puuid,
+                summoner_id,
+                int(profile_icon_id or 0),
+                int(summoner_level or 0),
+                solo_tier.upper(),
+                solo_rank.upper(),
+                int(league_points),
+                flex_tier.upper(),
+                flex_rank.upper(),
+                int(flex_league_points),
+                float(base_rating),
+                json.dumps(preferred, ensure_ascii=False),
+                champions_json,
+                int(player_id),
+            ),
+        )
+        for role in ROLES:
+            row = conn.execute(
+                "SELECT games_played FROM player_role_ratings WHERE player_id = ? AND role = ?",
+                (int(player_id), role),
+            ).fetchone()
+            games_played = int(row["games_played"] if row else 0)
+            if reset_role_ratings or games_played == 0:
+                conn.execute(
+                    """
+                    INSERT INTO player_role_ratings (player_id, role, rating, games_played, confidence)
+                    VALUES (?, ?, ?, 0, 0.45)
+                    ON CONFLICT(player_id, role) DO UPDATE SET
+                        rating = excluded.rating,
+                        games_played = CASE WHEN ? THEN 0 ELSE player_role_ratings.games_played END,
+                        confidence = CASE WHEN ? THEN 0.45 ELSE player_role_ratings.confidence END,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(player_id), role, float(role_priors[role]), bool(reset_role_ratings), bool(reset_role_ratings)),
+                )
+
+
 def list_players(conn: sqlite3.Connection) -> list[Player]:
+    if is_csv_conn(conn):
+        return [
+            _csv_player_from_row(row)
+            for row in sorted(_csv_read_dicts(conn.players_path), key=lambda item: int(item.get("id") or 0))
+            if str(row.get("name") or "").strip()
+        ]
+
     rows = conn.execute("SELECT * FROM players ORDER BY id ASC").fetchall()
     if not rows:
         return []
@@ -384,6 +761,12 @@ def list_players(conn: sqlite3.Connection) -> list[Player]:
 
 
 def get_player(conn: sqlite3.Connection, player_id: int) -> Player | None:
+    if is_csv_conn(conn):
+        for player in list_players(conn):
+            if player.id is not None and int(player.id) == int(player_id):
+                return player
+        return None
+
     row = conn.execute("SELECT * FROM players WHERE id = ?", (int(player_id),)).fetchone()
     if row is None:
         return None
@@ -403,10 +786,18 @@ def get_player(conn: sqlite3.Connection, player_id: int) -> Player | None:
 
 
 def count_players(conn: sqlite3.Connection) -> int:
+    if is_csv_conn(conn):
+        return len(list_players(conn))
     return int(conn.execute("SELECT COUNT(*) AS c FROM players").fetchone()["c"])
 
 
 def delete_all_data(conn) -> None:
+    if is_csv_conn(conn):
+        _csv_write_dicts(conn.players_path, CSV_PLAYER_COLUMNS, [])
+        _csv_write_dicts(conn.matches_path, CSV_MATCH_COLUMNS, [])
+        _csv_write_dicts(conn.participants_path, CSV_PARTICIPANT_COLUMNS, [])
+        return
+
     if is_postgres_conn(conn):
         conn.execute(
             "TRUNCATE TABLE match_participants, matches, player_role_ratings, players RESTART IDENTITY CASCADE"
@@ -458,6 +849,74 @@ def record_match_and_update(
         1.0
         / (1.0 + 10.0 ** (-(blue.total_rating - red.total_rating) / cfg["winrate_scale"]))
     )
+
+    if is_csv_conn(conn):
+        match_rows = _csv_read_dicts(conn.matches_path)
+        match_id = _csv_next_id(match_rows)
+        now = _now_text()
+        _csv_append_dict(
+            conn.matches_path,
+            CSV_MATCH_COLUMNS,
+            {
+                "id": match_id,
+                "played_at": now,
+                "blue_win": 1 if blue_win else 0,
+                "blue_score": int(blue_score),
+                "red_score": int(red_score),
+                "blue_rating_before": float(blue.total_rating),
+                "red_rating_before": float(red.total_rating),
+                "expected_blue_win": float(expected_blue),
+                "carry_player_ids": "|".join(str(x) for x in carry_ids),
+                "mvp_player_id": int(mvp_player_id) if mvp_player_id is not None else "",
+                "lane_impacts": json.dumps(lane_impacts, ensure_ascii=False),
+                "notes": notes,
+                "created_at": now,
+            },
+        )
+
+        player_rows = _csv_read_dicts(conn.players_path)
+        rows_by_id = {int(row.get("id") or 0): row for row in player_rows}
+        for change in changes:
+            row = rows_by_id.get(int(change.player_id))
+            if row is not None:
+                current_base = float(row.get("base_rating") or 50.0)
+                row[change.role] = float(change.after)
+                row[f"{change.role}_games"] = int(change.games_after)
+                row[f"{change.role}_confidence"] = float(change.confidence_after)
+                row["base_rating"] = float(clamp(current_base + change.delta * cfg["base_rating_share"]))
+                row["updated_at"] = now
+            _csv_append_dict(
+                conn.participants_path,
+                CSV_PARTICIPANT_COLUMNS,
+                {
+                    "match_id": match_id,
+                    "player_id": int(change.player_id),
+                    "team": change.team,
+                    "role": change.role,
+                    "rating_before": float(change.before),
+                    "rating_after": float(change.after),
+                    "delta": float(change.delta),
+                    "reason": change.reason,
+                },
+            )
+        _csv_write_dicts(conn.players_path, CSV_PLAYER_COLUMNS, player_rows)
+
+        if append_csv_log:
+            append_match_csv_log(
+                conn,
+                match_id=match_id,
+                blue=blue,
+                red=red,
+                blue_win=blue_win,
+                blue_score=blue_score,
+                red_score=red_score,
+                carry_player_ids=carry_ids,
+                mvp_player_id=mvp_player_id,
+                lane_impacts=lane_impacts,
+                notes=notes,
+                path=csv_log_path,
+            )
+        return match_id, [asdict(change) for change in changes]
 
     with conn:
         cur = conn.execute(
@@ -557,6 +1016,32 @@ def record_match_and_update(
 
 
 def list_matches(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    if is_csv_conn(conn):
+        rows: list[dict[str, Any]] = []
+        for row in _csv_read_dicts(conn.matches_path):
+            rows.append(
+                {
+                    "id": int(row.get("id") or 0),
+                    "played_at": row.get("played_at") or "",
+                    "blue_win": int(float(row.get("blue_win") or 0)),
+                    "blue_score": int(float(row.get("blue_score") or 0)),
+                    "red_score": int(float(row.get("red_score") or 0)),
+                    "blue_rating_before": float(row.get("blue_rating_before") or 0),
+                    "red_rating_before": float(row.get("red_rating_before") or 0),
+                    "expected_blue_win": float(row.get("expected_blue_win") or 0),
+                    "carry_player_ids_json": json.dumps(
+                        [int(x) for x in str(row.get("carry_player_ids") or "").split("|") if x],
+                        ensure_ascii=False,
+                    ),
+                    "mvp_player_id": int(row["mvp_player_id"]) if str(row.get("mvp_player_id") or "").strip() else None,
+                    "lane_impacts_json": row.get("lane_impacts") or "{}",
+                    "notes": row.get("notes") or "",
+                    "created_at": row.get("created_at") or "",
+                }
+            )
+        rows.sort(key=lambda item: (str(item["played_at"]), int(item["id"])), reverse=True)
+        return rows[: int(limit)]
+
     rows = conn.execute(
         """
         SELECT * FROM matches
@@ -569,6 +1054,29 @@ def list_matches(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, An
 
 
 def list_match_participants(conn: sqlite3.Connection, match_id: int) -> list[dict[str, Any]]:
+    if is_csv_conn(conn):
+        players = _csv_players_by_id(conn)
+        rows: list[dict[str, Any]] = []
+        for row in _csv_read_dicts(conn.participants_path):
+            if int(row.get("match_id") or 0) != int(match_id):
+                continue
+            player = players.get(int(row.get("player_id") or 0))
+            rows.append(
+                {
+                    "match_id": int(row.get("match_id") or 0),
+                    "player_id": int(row.get("player_id") or 0),
+                    "team": row.get("team") or "",
+                    "role": row.get("role") or "",
+                    "rating_before": float(row.get("rating_before") or 0),
+                    "rating_after": float(row.get("rating_after") or 0),
+                    "delta": float(row.get("delta") or 0),
+                    "reason": row.get("reason") or "",
+                    "name": player.name if player else "",
+                }
+            )
+        rows.sort(key=lambda item: (item["team"], ROLES.index(item["role"]) if item["role"] in ROLES else 99))
+        return rows
+
     rows = conn.execute(
         """
         SELECT mp.*, p.name
@@ -591,6 +1099,33 @@ def list_match_participants(conn: sqlite3.Connection, match_id: int) -> list[dic
 
 
 def list_player_match_history(conn: sqlite3.Connection, player_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    if is_csv_conn(conn):
+        matches = {int(row["id"]): row for row in list_matches(conn, limit=100000)}
+        rows: list[dict[str, Any]] = []
+        for row in _csv_read_dicts(conn.participants_path):
+            if int(row.get("player_id") or 0) != int(player_id):
+                continue
+            match = matches.get(int(row.get("match_id") or 0))
+            if not match:
+                continue
+            rows.append(
+                {
+                    "match_id": int(row.get("match_id") or 0),
+                    "played_at": match["played_at"],
+                    "blue_win": match["blue_win"],
+                    "carry_player_ids_json": match["carry_player_ids_json"],
+                    "mvp_player_id": match["mvp_player_id"],
+                    "team": row.get("team") or "",
+                    "role": row.get("role") or "",
+                    "rating_before": float(row.get("rating_before") or 0),
+                    "rating_after": float(row.get("rating_after") or 0),
+                    "delta": float(row.get("delta") or 0),
+                    "reason": row.get("reason") or "",
+                }
+            )
+        rows.sort(key=lambda item: (str(item["played_at"]), int(item["match_id"])), reverse=True)
+        return rows[: int(limit)]
+
     rows = conn.execute(
         """
         SELECT
@@ -669,7 +1204,11 @@ def export_players_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "solo_tier": player.solo_tier,
             "solo_rank": player.solo_rank,
             "league_points": player.league_points,
+            "flex_tier": player.flex_tier,
+            "flex_rank": player.flex_rank,
+            "flex_league_points": player.flex_league_points,
             "preferred_roles": "|".join(player.preferred_roles),
+            "top_champions_json": json.dumps(player.lane_champions, ensure_ascii=False),
         }
         for role in ROLES:
             row[role] = round(player.rating_for(role), 3)
@@ -681,12 +1220,49 @@ def _names_for_ids(conn: sqlite3.Connection, player_ids: Iterable[int]) -> dict[
     ids = [int(x) for x in player_ids]
     if not ids:
         return {}
+    if is_csv_conn(conn):
+        players = _csv_players_by_id(conn)
+        return {pid: players[pid].name for pid in ids if pid in players}
     placeholders = ",".join("?" for _ in ids)
     rows = conn.execute(f"SELECT id, name FROM players WHERE id IN ({placeholders})", ids).fetchall()
     return {int(row["id"]): str(row["name"]) for row in rows}
 
 
 def match_export_row(conn: sqlite3.Connection, match_id: int) -> dict[str, Any]:
+    if is_csv_conn(conn):
+        matches = {int(row["id"]): row for row in list_matches(conn, limit=100000)}
+        match = matches.get(int(match_id))
+        if match is None:
+            raise ValueError(f"match not found: {match_id}")
+        players = _csv_players_by_id(conn)
+        participants = list_match_participants(conn, int(match_id))
+        by_slot = {
+            (str(row["team"]).lower(), str(row["role"]).lower()): players.get(int(row["player_id"]))
+            for row in participants
+        }
+        carry_ids = [int(x) for x in json.loads(match["carry_player_ids_json"] or "[]")]
+        carry_names = _names_for_ids(conn, carry_ids)
+        mvp_player = ""
+        if match["mvp_player_id"] is not None:
+            mvp_player = _names_for_ids(conn, [int(match["mvp_player_id"])]).get(int(match["mvp_player_id"]), "")
+        lane_impacts = json.loads(match["lane_impacts_json"] or "{}")
+        row: dict[str, Any] = {
+            "played_at": match["played_at"],
+            "blue_win": "BLUE" if bool(match["blue_win"]) else "RED",
+            "blue_score": int(match["blue_score"] or 0),
+            "red_score": int(match["red_score"] or 0),
+            "carry_players": "|".join(carry_names.get(pid, "") for pid in carry_ids if carry_names.get(pid, "")),
+            "mvp_player": mvp_player,
+            "notes": match["notes"] or "",
+        }
+        for team in ("blue", "red"):
+            for role in ROLES:
+                player = by_slot.get((team, role.lower()))
+                row[f"{team}_{role.lower()}"] = player.name if player else ""
+        for role in ROLES:
+            row[f"lane_{role.lower()}"] = lane_impacts.get(role, "鍮꾨벑")
+        return {column: row.get(column, "") for column in EXPORT_MATCH_COLUMNS}
+
     match = conn.execute("SELECT * FROM matches WHERE id = ?", (int(match_id),)).fetchone()
     if match is None:
         raise ValueError(f"match not found: {match_id}")
@@ -727,6 +1303,9 @@ def match_export_row(conn: sqlite3.Connection, match_id: int) -> dict[str, Any]:
 
 
 def export_matches_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    if is_csv_conn(conn):
+        rows = sorted(list_matches(conn, limit=100000), key=lambda item: (str(item["played_at"]), int(item["id"])))
+        return [match_export_row(conn, int(row["id"])) for row in rows]
     rows = conn.execute("SELECT id FROM matches ORDER BY played_at ASC, id ASC").fetchall()
     return [match_export_row(conn, int(row["id"])) for row in rows]
 
@@ -751,3 +1330,16 @@ def append_match_export_csv(
             writer.writeheader()
         writer.writerow(row)
     return path
+
+
+def update_match_played_at(conn, match_id: int, played_at: str) -> None:
+    if is_csv_conn(conn):
+        rows = _csv_read_dicts(conn.matches_path)
+        for row in rows:
+            if int(row.get("id") or 0) == int(match_id):
+                row["played_at"] = played_at
+                break
+        _csv_write_dicts(conn.matches_path, CSV_MATCH_COLUMNS, rows)
+        return
+    conn.execute("UPDATE matches SET played_at = ? WHERE id = ?", (played_at, int(match_id)))
+    conn.commit()

@@ -82,14 +82,17 @@ def append_match_csv_log(
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    match_row = conn.execute(
-        """
-        SELECT played_at, blue_rating_before, red_rating_before, expected_blue_win
-        FROM matches
-        WHERE id = ?
-        """,
-        (int(match_id),),
-    ).fetchone()
+    if hasattr(conn, "get_match_row"):
+        match_row = conn.get_match_row(int(match_id))
+    else:
+        match_row = conn.execute(
+            """
+            SELECT played_at, blue_rating_before, red_rating_before, expected_blue_win
+            FROM matches
+            WHERE id = ?
+            """,
+            (int(match_id),),
+        ).fetchone()
     played_at = match_row["played_at"] if match_row is not None else ""
     blue_rating_before = match_row["blue_rating_before"] if match_row is not None else blue.total_rating
     red_rating_before = match_row["red_rating_before"] if match_row is not None else red.total_rating

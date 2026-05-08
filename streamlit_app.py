@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import csv
+import io
 import json
 import textwrap
 from dataclasses import asdict, is_dataclass
@@ -13,7 +15,8 @@ import streamlit as st
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # 명시적으로 .env만 읽습니다. .env.example은 템플릿 파일로만 남깁니다.
+    load_dotenv(dotenv_path=Path(".env"), override=True)
 except Exception:  # noqa: BLE001
     pass
 
@@ -40,6 +43,8 @@ from inhouse_balancer.storage import (
     count_players,
     create_player,
     delete_all_data,
+    export_matches_rows,
+    export_players_rows,
     init_db,
     list_match_participants,
     list_matches,
@@ -51,13 +56,12 @@ from inhouse_balancer.storage import (
 DB_PATH = Path("data/inhouse_balancer.sqlite")
 
 
-def secret_or_env(key: str, default: str = "") -> str:
-    try:
-        value = st.secrets.get(key, "")
-        if value:
-            return str(value)
-    except Exception:  # noqa: BLE001
-        pass
+def env_value(key: str, default: str = "") -> str:
+    """Read configuration from the local .env/environment only.
+
+    .env.example is intentionally never loaded. In local development, values in .env
+    override shell environment variables because load_dotenv(..., override=True) is used above.
+    """
     return os.getenv(key, default)
 
 
@@ -72,7 +76,18 @@ ROLE_META = {
 
 @st.cache_resource
 def get_conn():
-    database_url = secret_or_env("DATABASE_URL", "")
+    storage_mode = env_value("INHOUSE_STORAGE", "").strip().lower()
+    database_url_from_env = env_value("DATABASE_URL", "").strip()
+
+    # .env에 DATABASE_URL이 있으면 기본적으로 DB를 사용합니다.
+    # CSV/SQLite를 강제로 쓰고 싶을 때만 INHOUSE_STORAGE=csv 또는 sqlite를 명시하세요.
+    if storage_mode in {"csv", "file", "files", "sqlite"}:
+        database_url = ""
+    elif storage_mode in {"postgres", "postgresql", "db"} or database_url_from_env:
+        database_url = database_url_from_env
+    else:
+        database_url = ""
+
     conn = connect(DB_PATH, database_url=database_url)
     init_db(conn)
     # Real-data mode: do not auto-generate sample players.
@@ -340,6 +355,14 @@ def inject_css() -> None:
         .slot-role { display:flex; align-items:center; gap:.38rem; font-size:.76rem; color:#cbd6ff; font-weight:900; }
         .slot-player { font-weight:900; color:#f3f6ff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .slot-tier { color:#9aa6c7; font-size:.72rem; margin-top:.08rem; }
+        .slot-champs { display:flex; gap:.28rem; flex-wrap:wrap; margin-top:.32rem; }
+        .champ-pill {
+            display:inline-flex; align-items:center; gap:.16rem;
+            padding:.18rem .38rem; border-radius:999px;
+            background:rgba(90,167,255,.11); border:1px solid rgba(90,167,255,.18);
+            color:#cfe1ff; font-size:.68rem; font-weight:800;
+        }
+        .champ-pill.empty { color:#8794bb; background:rgba(255,255,255,.035); border-color:rgba(255,255,255,.055); }
         .slot-rating { text-align:right; font-weight:950; color:#f7faff; }
         .slot-rating small { display:block; color:#8b96ba; font-size:.66rem; font-weight:700; }
         .status-pill { padding:.22rem .38rem; font-size:.68rem; }
@@ -390,6 +413,161 @@ def inject_css() -> None:
             .slot-row { grid-template-columns: 64px 1fr 60px; }
             .slot-row .status-pill { display:none; }
             .hero-row, .team-head, .profile-head { flex-direction:column; display:flex; }
+        }
+
+        .dashboard-kpi-grid {
+            display:grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap:.8rem;
+            margin-bottom: 1rem;
+        }
+        .dashboard-kpi-card {
+            border: 1px solid rgba(122, 145, 255, .18);
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(16, 24, 46, .92), rgba(9, 14, 28, .92));
+            padding: .95rem 1rem;
+            box-shadow: 0 12px 28px rgba(0,0,0,.18);
+        }
+        .dashboard-kpi-label {
+            color: var(--muted);
+            font-size: .78rem;
+            font-weight: 700;
+        }
+        .dashboard-kpi-value {
+            color: #f8faff;
+            font-size: 1.45rem;
+            font-weight: 950;
+            margin-top: .18rem;
+            letter-spacing: -.03em;
+        }
+        .dashboard-kpi-sub {
+            color: #8a98bf;
+            font-size: .74rem;
+            margin-top: .12rem;
+        }
+
+        .dashboard-top-grid {
+            display:grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap:.8rem;
+            margin-bottom: 1rem;
+        }
+        .dashboard-top-card {
+            border-radius: 20px;
+            padding: 1rem;
+            border: 1px solid rgba(122,145,255,.18);
+            background: linear-gradient(180deg, rgba(17, 26, 48, .94), rgba(8, 13, 26, .94));
+            box-shadow: 0 16px 34px rgba(0,0,0,.20);
+        }
+        .dashboard-top-rank {
+            font-size: .78rem;
+            font-weight: 900;
+            letter-spacing: .08em;
+            color: #9fb0e8;
+            margin-bottom: .35rem;
+        }
+        .dashboard-top-name {
+            color:#f8fbff;
+            font-size:1.15rem;
+            font-weight:950;
+            margin-bottom:.25rem;
+        }
+        .dashboard-top-meta {
+            color:#9aa6c7;
+            font-size:.82rem;
+            margin-bottom:.7rem;
+        }
+        .dashboard-top-stats {
+            display:grid;
+            grid-template-columns: repeat(3, minmax(0,1fr));
+            gap:.45rem;
+        }
+        .dashboard-stat-box {
+            border-radius: 14px;
+            padding: .6rem .55rem;
+            background: rgba(255,255,255,.04);
+            border: 1px solid rgba(255,255,255,.05);
+        }
+        .dashboard-stat-box .label {
+            color:#8b98bc;
+            font-size:.68rem;
+            font-weight:700;
+        }
+        .dashboard-stat-box .value {
+            color:#f5f8ff;
+            font-size:.95rem;
+            font-weight:900;
+            margin-top:.1rem;
+        }
+
+        .dashboard-rank-table {
+            width:100%;
+            border-collapse: separate;
+            border-spacing: 0 .48rem;
+        }
+        .dashboard-rank-table th {
+            color:#8c99bf;
+            font-size:.73rem;
+            font-weight:800;
+            text-align:left;
+            padding: 0 .65rem .15rem;
+        }
+        .dashboard-rank-table td {
+            background: rgba(9, 15, 29, .78);
+            border-top: 1px solid rgba(110, 132, 255, .14);
+            border-bottom: 1px solid rgba(110, 132, 255, .14);
+            padding: .68rem .65rem;
+            color:#e9edff;
+            vertical-align: middle;
+        }
+        .dashboard-rank-table tr td:first-child {
+            border-left: 1px solid rgba(110,132,255,.14);
+            border-radius: 14px 0 0 14px;
+        }
+        .dashboard-rank-table tr td:last-child {
+            border-right: 1px solid rgba(110,132,255,.14);
+            border-radius: 0 14px 14px 0;
+        }
+        .rank-badge {
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            min-width:34px;
+            height:28px;
+            border-radius:999px;
+            background: rgba(120,145,255,.12);
+            border:1px solid rgba(120,145,255,.22);
+            color:#eef3ff;
+            font-size:.76rem;
+            font-weight:900;
+        }
+        .player-strong {
+            color:#f6f9ff;
+            font-weight:900;
+        }
+        .winrate-track {
+            width: 120px;
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,.06);
+            border:1px solid rgba(255,255,255,.04);
+            overflow:hidden;
+            margin-top:.22rem;
+        }
+        .winrate-fill {
+            height:100%;
+            border-radius:999px;
+            background: linear-gradient(90deg, #2f80ff, #73baff);
+        }
+        .lp-pos { color: #6ee7b7; font-weight: 900; }
+        .lp-neg { color: #ff8aa0; font-weight: 900; }
+        .lp-mid { color: #f3f6ff; font-weight: 900; }
+
+        @media (max-width: 1100px) {
+            .dashboard-kpi-grid,
+            .dashboard-top-grid {
+                grid-template-columns: repeat(2, minmax(0,1fr));
+            }
         }
         </style>
         """
@@ -682,6 +860,7 @@ def render_player_pool(
         selected = "✓" if p.name in selected_names else str(idx)
         role_cells = "".join(f"<td>{role_chip(role, p.rating_for(role))}</td>" for role in ROLES)
         tier = f"{p.solo_tier} {p.solo_rank}".strip()
+        flex_tier = f"{getattr(p, 'flex_tier', 'UNRANKED')} {getattr(p, 'flex_rank', '')}".strip()
         rows.append(
             f"""
             <tr>
@@ -695,7 +874,10 @@ def render_player_pool(
                         </div>
                     </div>
                 </td>
-                <td><span class="tier-badge">{e(tier)}</span></td>
+                <td>
+                    <span class="tier-badge">Solo {e(tier)}</span>
+                    <div class="player-id">Flex {e(flex_tier)}</div>
+                </td>
                 {role_cells}
                 <td>{pref_pills(p.preferred_roles)}</td>
             </tr>
@@ -737,6 +919,20 @@ def render_player_pool(
     )
 
 
+def champion_pills_html(player, role: str) -> str:
+    picks = (getattr(player, "lane_champions", {}) or {}).get(role, [])[:3]
+    if not picks:
+        return '<span class="champ-pill empty">Most 기록 없음</span>'
+
+    pills = []
+    for item in picks:
+        champion = item.get("champion", "") if isinstance(item, dict) else str(item)
+        games = item.get("games", 0) if isinstance(item, dict) else 0
+        label = f"{champion} {games}판" if games else champion
+        pills.append(f'<span class="champ-pill">{e(label)}</span>')
+    return "".join(pills)
+
+
 def team_card_html(assignment) -> str:
     total = float(assignment.total_rating)
     fill = max(6, min(100, total / 5.0))
@@ -750,6 +946,7 @@ def team_card_html(assignment) -> str:
         status_class = "status-ok" if ok else "status-warn"
         status_text = "일치" if ok else "오프롤"
         meta = ROLE_META[role]
+        champ_pills = champion_pills_html(p, role)
         rows.append(
             f"""
             <div class="slot-row">
@@ -757,6 +954,7 @@ def team_card_html(assignment) -> str:
                 <div>
                     <div class="slot-player">{e(p.label_name)}</div>
                     <div class="slot-tier">{e(p.name)} · {e(meta['label'])} · {e(tier)} · 선호 {', '.join(p.preferred_roles) if p.preferred_roles else '상관없음'}</div>
+                    <div class="slot-champs">{champ_pills}</div>
                 </div>
                 <div class="slot-rating"><span class="{rating_color_class(rating)}">{rating:.1f}</span><small>{e(tier)}</small></div>
                 <div><span class="status-pill {status_class}">{status_text}</span></div>
@@ -914,33 +1112,187 @@ def role_bars_html(player) -> str:
 
 def page_dashboard(conn) -> None:
     players = list_players(conn)
-    matches = list_matches(conn, limit=1000)
-    avg_base = sum(p.base_rating for p in players) / len(players) if players else 0
+    matches = list_matches(conn, limit=5000)
+
     render_hero(
         "Dashboard",
-        "내전 밸런서 대시보드",
-        "등록된 플레이어, 누적 경기, 평균 실력치를 한눈에 확인합니다.",
-        metric_cards([
-            ("등록 플레이어", str(len(players)), "Players"),
-            ("기록된 경기", str(len(matches)), "Matches"),
-            ("평균 종합 실력", f"{avg_base:.1f}", "Base rating"),
-        ]),
+        "내전 대시보드",
+        "플레이어별 누적 성적, 승률, 내전 LP를 한눈에 확인합니다.",
     )
 
-    panel_start("최근 경기", "가장 최근에 저장된 경기 결과입니다.")
-    if matches:
-        df = pd.DataFrame(matches)
-        df["승리팀"] = df["blue_win"].map(lambda x: "BLUE" if x else "RED")
-        df["Blue 예상 승률"] = (df["expected_blue_win"] * 100).round(1)
-        st.dataframe(
-            df[["id", "played_at", "승리팀", "blue_score", "red_score", "Blue 예상 승률"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("아직 기록된 경기가 없습니다.")
-    panel_end()
+    if not players:
+        st.info("등록된 플레이어가 없습니다.")
+        return
 
+    rows = []
+    for p in players:
+        history = list_player_match_history(conn, int(p.id), limit=10000)
+
+        wins = 0
+        losses = 0
+        for h in history:
+            is_win = (
+                (h["team"] == "BLUE" and h["blue_win"])
+                or (h["team"] == "RED" and not h["blue_win"])
+            )
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+
+        total_games = wins + losses
+        winrate = (wins / total_games * 100.0) if total_games else 0.0
+        inhouse_lp = int(round((wins - losses) * 15 + winrate))
+
+        rows.append(
+            {
+                "플레이어": p.label_name,
+                "승": wins,
+                "패": losses,
+                "승률_num": winrate,
+                "승률": f"{winrate:.1f}%",
+                "내전 LP": inhouse_lp,
+                "경기 수": total_games,
+            }
+        )
+
+    df = pd.DataFrame(rows).sort_values(
+        by=["내전 LP", "승률_num", "승"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+
+    total_matches = len(matches)
+    total_players = len(players)
+
+    top_winrate_player = df.loc[df["승률_num"].idxmax(), "플레이어"] if not df.empty else "-"
+    top_lp_player = df.loc[df["내전 LP"].idxmax(), "플레이어"] if not df.empty else "-"
+
+    render_html(
+        f"""
+        <div class="dashboard-kpi-grid">
+            <div class="dashboard-kpi-card">
+                <div class="dashboard-kpi-label">등록 플레이어</div>
+                <div class="dashboard-kpi-value">{total_players}</div>
+                <div class="dashboard-kpi-sub">현재 내전 참가 풀</div>
+            </div>
+            <div class="dashboard-kpi-card">
+                <div class="dashboard-kpi-label">누적 경기 수</div>
+                <div class="dashboard-kpi-value">{total_matches}</div>
+                <div class="dashboard-kpi-sub">저장된 전체 경기</div>
+            </div>
+            <div class="dashboard-kpi-card">
+                <div class="dashboard-kpi-label">최고 승률 플레이어</div>
+                <div class="dashboard-kpi-value">{e(top_winrate_player)}</div>
+                <div class="dashboard-kpi-sub">승률 기준 리더</div>
+            </div>
+            <div class="dashboard-kpi-card">
+                <div class="dashboard-kpi-label">최고 내전 LP</div>
+                <div class="dashboard-kpi-value">{e(top_lp_player)}</div>
+                <div class="dashboard-kpi-sub">현재 랭킹 1위</div>
+            </div>
+        </div>
+        """
+    )
+
+    top3 = df.head(3).to_dict("records")
+    top_cards = []
+    medals = ["🥇", "🥈", "🥉"]
+    for i, row in enumerate(top3):
+        top_cards.append(
+            f"""
+            <div class="dashboard-top-card">
+                <div class="dashboard-top-rank">{medals[i]} TOP {i+1}</div>
+                <div class="dashboard-top-name">{e(row["플레이어"])}</div>
+                <div class="dashboard-top-meta">{row["경기 수"]} games · {row["승"]}승 {row["패"]}패</div>
+                <div class="dashboard-top-stats">
+                    <div class="dashboard-stat-box">
+                        <div class="label">승률</div>
+                        <div class="value">{row["승률"]}</div>
+                    </div>
+                    <div class="dashboard-stat-box">
+                        <div class="label">내전 LP</div>
+                        <div class="value">{row["내전 LP"]}</div>
+                    </div>
+                    <div class="dashboard-stat-box">
+                        <div class="label">순위</div>
+                        <div class="value">#{i+1}</div>
+                    </div>
+                </div>
+            </div>
+            """
+        )
+
+    render_html(
+        f"""
+        <div class="panel">
+            <div class="panel-title-row">
+                <div>
+                    <div class="panel-title">TOP 3 플레이어</div>
+                    <div class="panel-subtitle">현재 내전 성적 기준 상위 플레이어입니다.</div>
+                </div>
+            </div>
+            <div class="dashboard-top-grid">
+                {''.join(top_cards)}
+            </div>
+        </div>
+        """
+    )
+
+    table_rows = []
+    for idx, row in df.iterrows():
+        winrate = float(row["승률_num"])
+        lp = int(row["내전 LP"])
+        lp_class = "lp-pos" if lp > 0 else "lp-neg" if lp < 0 else "lp-mid"
+
+        table_rows.append(
+            f"""
+            <tr>
+                <td><span class="rank-badge">#{idx+1}</span></td>
+                <td><span class="player-strong">{e(row["플레이어"])}</span></td>
+                <td>{row["승"]}</td>
+                <td>{row["패"]}</td>
+                <td>
+                    <div>{row["승률"]}</div>
+                    <div class="winrate-track">
+                        <div class="winrate-fill" style="width:{winrate:.1f}%"></div>
+                    </div>
+                </td>
+                <td><span class="{lp_class}">{lp}</span></td>
+                <td style="color:#9aa6c7;">{row["경기 수"]}</td>
+            </tr>
+            """
+        )
+
+    render_html(
+        f"""
+        <div class="panel">
+            <div class="panel-title-row">
+                <div>
+                    <div class="panel-title">내전 랭킹</div>
+                    <div class="panel-subtitle">내전 LP, 승률, 승수를 기준으로 정렬됩니다.</div>
+                </div>
+                <div class="subtle-tag">Ranking Table</div>
+            </div>
+
+            <table class="dashboard-rank-table">
+                <thead>
+                    <tr>
+                        <th style="width:70px;">순위</th>
+                        <th>플레이어</th>
+                        <th>승</th>
+                        <th>패</th>
+                        <th>승률</th>
+                        <th>내전 LP</th>
+                        <th>경기 수</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(table_rows)}
+                </tbody>
+            </table>
+        </div>
+        """
+    )
 
 def _candidate_editor_version() -> int:
     return int(st.session_state.get("assignment_editor_version", 0))
@@ -1016,21 +1368,23 @@ DRAG_BOARD_STYLE = """
     background: transparent;
     padding: 2px 0 0 0;
 }
+
 .sortable-component.vertical .sortable-container {
     min-width: 0;
     margin: 0;
     padding: 0;
     border-radius: 18px;
     overflow: hidden;
-    border: 1px solid rgba(99, 126, 205, .32);
+    border: 1px solid rgba(255, 91, 118, .42);
     background: rgba(10, 18, 37, .84);
 }
-.sortable-component.vertical .sortable-container:nth-child(1) {
+
+/* 실제 화면상 BLUE에 먹는 selector */
+.sortable-component.vertical .sortable-container:nth-child(2) {
     border-color: rgba(74, 143, 255, .45);
 }
-.sortable-component.vertical .sortable-container:nth-child(2) {
-    border-color: rgba(255, 91, 118, .42);
-}
+
+/* 기본 헤더 = RED */
 .sortable-container-header {
     margin: 0;
     padding: 12px 16px;
@@ -1038,11 +1392,14 @@ DRAG_BOARD_STYLE = """
     font-weight: 900;
     letter-spacing: .08em;
     font-size: 15px;
-    background: linear-gradient(135deg, rgba(45, 94, 189, .42), rgba(16, 24, 50, .85));
+    background: linear-gradient(135deg, rgba(193, 50, 78, .52), rgba(16, 24, 50, .85));
 }
+
+/* 실제 화면상 BLUE 헤더에 먹는 selector */
 .sortable-container:nth-child(2) .sortable-container-header {
-    background: linear-gradient(135deg, rgba(193, 50, 78, .42), rgba(16, 24, 50, .85));
+    background: linear-gradient(135deg, rgba(45, 94, 189, .52), rgba(16, 24, 50, .85));
 }
+
 .sortable-container-header::after {
     content: "  ·  위에서부터 TOP / JG / MID / ADC / SUP";
     color: #93a7df;
@@ -1050,6 +1407,7 @@ DRAG_BOARD_STYLE = """
     font-weight: 700;
     letter-spacing: .02em;
 }
+
 .sortable-container-body {
     margin: 0;
     padding: 10px;
@@ -1059,24 +1417,30 @@ DRAG_BOARD_STYLE = """
     background: rgba(5, 10, 23, .38);
     counter-reset: slot;
 }
-.sortable-item, .sortable-item:hover {
+
+/* 기본 아이템 = RED */
+.sortable-item,
+.sortable-item:hover {
     display: flex !important;
     align-items: center;
     min-height: 42px;
     margin: 8px 0;
     padding: 9px 12px;
     border-radius: 12px;
-    background: rgba(65, 140, 255, .86);
+    background: rgba(239, 88, 112, .86);
     color: #ffffff;
     font-size: 14px;
     font-weight: 800;
     line-height: 1.25;
     box-shadow: 0 10px 22px rgba(0, 0, 0, .24);
 }
+
+/* 실제 화면상 BLUE 아이템에 먹는 selector */
 .sortable-container:nth-child(2) .sortable-item,
 .sortable-container:nth-child(2) .sortable-item:hover {
-    background: rgba(239, 88, 112, .86);
+    background: rgba(65, 140, 255, .86);
 }
+
 .sortable-item::before {
     counter-increment: slot;
     display: inline-flex;
@@ -1092,16 +1456,22 @@ DRAG_BOARD_STYLE = """
     font-weight: 950;
     letter-spacing: .05em;
 }
+
 .sortable-item:nth-child(1)::before { content: "TOP"; }
 .sortable-item:nth-child(2)::before { content: "JG"; }
 .sortable-item:nth-child(3)::before { content: "MID"; }
 .sortable-item:nth-child(4)::before { content: "ADC"; }
 .sortable-item:nth-child(5)::before { content: "SUP"; }
+
 .sortable-item:active {
     cursor: grabbing;
     transform: scale(.99);
 }
-.active { opacity: .62; }
+
+.active {
+    opacity: .62;
+}
+
 @media (max-width: 760px) {
     .sortable-component.vertical {
         grid-template-columns: 1fr;
@@ -1144,26 +1514,6 @@ def team_copy_text(candidate, mode: str = "two_col_display") -> str:
     def display(player):
         return getattr(player, "label_name", None) or player.name
 
-    if mode == "team_blocks":
-        blue_names = "\n".join(candidate.blue.slots[role].name for role in ROLES)
-        red_names = "\n".join(candidate.red.slots[role].name for role in ROLES)
-        return f"BLUE\n{blue_names}\n====================\nRED\n{red_names}"
-    if mode == "team_blocks_display":
-        blue_names = "\n".join(display(candidate.blue.slots[role]) for role in ROLES)
-        red_names = "\n".join(display(candidate.red.slots[role]) for role in ROLES)
-        return f"BLUE\n{blue_names}\n====================\nRED\n{red_names}"
-    if mode == "with_roles":
-        lines = ["포지션\tBLUE\tRED"]
-        lines.extend(
-            f"{role}\t{candidate.blue.slots[role].name}\t{candidate.red.slots[role].name}"
-            for role in ROLES
-        )
-        return "\n".join(lines)
-    if mode == "two_col_riot":
-        return "\n".join(
-            f"{candidate.blue.slots[role].name}\t{candidate.red.slots[role].name}"
-            for role in ROLES
-        )
     return "\n".join(
         f"{display(candidate.blue.slots[role])}\t{display(candidate.red.slots[role])}"
         for role in ROLES
@@ -1171,26 +1521,25 @@ def team_copy_text(candidate, mode: str = "two_col_display") -> str:
 
 def render_copy_export_panel(candidate) -> None:
     panel_start("팀 복붙", "위에서 아래 순서는 TOP / JG / MID / ADC / SUP입니다. 표시이름은 players.csv의 display_name/이름 컬럼을 사용합니다.", tag="Copy")
-    fmt = st.radio(
-        "복붙 형식",
-        options=["2열 표시이름", "2열 Riot ID", "포지션 포함", "팀별 Riot ID", "팀별 표시이름"],
-        index=0,
-        horizontal=True,
-    )
-    mode = {
-        "2열 표시이름": "two_col_display",
-        "2열 Riot ID": "two_col_riot",
-        "포지션 포함": "with_roles",
-        "팀별 Riot ID": "team_blocks",
-        "팀별 표시이름": "team_blocks_display",
-    }[fmt]
-    text_value = team_copy_text(candidate, mode)
-    st.text_area(
-        "복사 내용",
-        value=text_value,
-        height=230 if mode.startswith("team_blocks") else 150,
-        help="텍스트 영역 안을 클릭한 뒤 Ctrl+A, Ctrl+C로 복사하면 됩니다.",
-    )
+    text_value = team_copy_text(candidate, "two_col_display")
+    col1, col2 = st.columns([0.85, 0.15])
+    with col1:
+        st.text_area(
+            "복사 내용",
+            value=text_value,
+            height=150,
+            disabled=True,
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        if st.button("📋 복사", use_container_width=True):
+            import pyperclip
+            try:
+                pyperclip.copy(text_value)
+                st.success("클립보드에 복사됨!")
+            except Exception:
+                st.error("복사 실패 (pyperclip 미설치)")
     panel_end()
 
 
@@ -1320,7 +1669,7 @@ def page_team_builder(conn) -> None:
         default=default_names,
         max_selections=10,
     )
-    col_a, col_b, col_c = st.columns([0.42, 0.25, 0.33])
+    col_a, col_b = st.columns([0.58, 0.42])
     with col_a:
         preference_weight = st.slider(
             "선호 포지션 반영 강도",
@@ -1331,11 +1680,10 @@ def page_team_builder(conn) -> None:
             help="높을수록 오프롤 배정을 더 강하게 피합니다.",
         )
     with col_b:
-        top_k = st.slider("후보 개수", 1, 5, 1)
-    with col_c:
         st.write("")
         st.write("")
         generate_clicked = st.button("⚖️ 균형 잡힌 팀 생성", type="primary", use_container_width=True)
+    top_k = 1  # 항상 1개의 최적 후보만 생성
     panel_end()
 
     selected = [p for p in players if p.name in selected_names]
@@ -1426,16 +1774,14 @@ def page_match_result(conn) -> None:
         render_html(roster_compact_html(candidate.red, "RED TEAM"))
 
     panel_start("결과 정보", "승리팀, 스코어, 메모를 입력합니다.", tag="Outcome")
-    result_cols = st.columns([0.35, 0.2, 0.2, 0.25])
+    result_cols = st.columns([0.35, 0.65])
     with result_cols[0]:
         winner = st.radio("승리팀", options=["BLUE", "RED"], horizontal=True)
     with result_cols[1]:
-        blue_score = st.number_input("Blue score", min_value=0, max_value=99, value=1 if winner == "BLUE" else 0)
-    with result_cols[2]:
-        red_score = st.number_input("Red score", min_value=0, max_value=99, value=0 if winner == "BLUE" else 1)
-    with result_cols[3]:
         notes = st.text_input("메모", placeholder="예: 바텀 스노우볼")
     panel_end()
+    blue_score = 1 if winner == "BLUE" else 0
+    red_score = 0 if winner == "BLUE" else 1
 
     winning_assignment = candidate.blue if winner == "BLUE" else candidate.red
     blue_win = winner == "BLUE"
@@ -1505,6 +1851,7 @@ def page_match_result(conn) -> None:
             mvp_player_id=mvp_id,
             lane_impacts=lane_impacts,
             notes=notes,
+            append_csv_log=False,
         )
         csv_log_path = append_match_csv_log(
             conn,
@@ -1519,7 +1866,7 @@ def page_match_result(conn) -> None:
             lane_impacts=lane_impacts,
             notes=notes,
         )
-        st.success(f"경기 #{match_id} 저장 완료. SQLite 저장 + CSV 로그 append 완료: {csv_log_path}")
+        st.success(f"경기 #{match_id} 저장 완료. CSV 저장 + append 로그 완료: {csv_log_path}")
         st.session_state.pop("latest_candidate", None)
         st.session_state.pop("candidate_list", None)
         st.dataframe(change_df(saved_changes), use_container_width=True, hide_index=True)
@@ -1635,17 +1982,57 @@ def page_history(conn) -> None:
     panel_start("경기 목록", "최근 100개 경기")
     rows = []
     for m in matches:
+        winner = "BLUE" if m["blue_win"] else "RED"
+        blue_expected_win = round(m["expected_blue_win"] * 100, 1)
         rows.append(
             {
                 "id": m["id"],
                 "일시": m["played_at"],
-                "승리팀": "BLUE" if m["blue_win"] else "RED",
-                "스코어": f"{m['blue_score']}:{m['red_score']}",
-                "Blue 예상승률": round(m["expected_blue_win"] * 100, 1),
+                "승리팀": winner,
+                "BLUE 예상 승률": blue_expected_win,
                 "메모": m["notes"],
             }
         )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    
+    # 승리팀 색상화를 위한 HTML 테이블 렌더링
+    table_rows = []
+    for row in rows:
+        winner_color = "var(--blue)" if row["승리팀"] == "BLUE" else "var(--red)"
+        winrate = float(row["BLUE 예상 승률"])
+        winrate_color = "var(--blue)" if winrate >= 50.0 else "var(--red)"
+
+        table_rows.append(
+            f"""
+            <tr>
+                <td>{row['id']}</td>
+                <td>{row['일시']}</td>
+                <td style="color: {winner_color}; font-weight: 900;">{row['승리팀']}</td>
+                <td style="color: {winrate_color}; font-weight: 400;">{winrate:.1f}%</td>
+                <td>{row['메모']}</td>
+            </tr>
+            """
+        )
+    
+    render_html(
+        f"""
+        <div class="panel">
+            <table class="player-table">
+                <thead>
+                    <tr>
+                        <th style="width: 60px;">경기 ID</th>
+                        <th>일시</th>
+                        <th>승리팀</th>
+                        <th>BLUE 예상승률</th>
+                        <th>메모</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(table_rows)}
+                </tbody>
+            </table>
+        </div>
+        """
+    )
     panel_end()
 
     panel_start("상세 경기", "선택한 경기의 참가자별 변화량")
@@ -1667,6 +2054,15 @@ def _save_uploaded_csv(uploaded_file, target_dir: Path, filename: str) -> Path:
 def _report_to_frame(report) -> pd.DataFrame:
     rows = [{"구분": "가져오기 성공", "개수": report.imported}, {"구분": "스킵/오류", "개수": report.skipped}]
     return pd.DataFrame(rows)
+
+
+def _csv_download_bytes(rows: list[dict], columns: list[str]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({column: row.get(column, "") for column in columns})
+    return buffer.getvalue().encode("utf-8-sig")
 
 
 def page_import_sync(conn) -> None:
@@ -1800,14 +2196,25 @@ def page_import_sync(conn) -> None:
         panel_end()
 
     with right:
-        panel_start("Riot API 랭크 갱신", "Riot ID가 있는 플레이어의 솔로랭크와 선택적 최근 포지션을 갱신합니다.", tag="Riot")
-        api_key = st.text_input("RIOT_API_KEY", type="password", placeholder="비워두면 환경변수 RIOT_API_KEY 사용")
-        infer_roles_count = st.slider("최근 매치 기반 선호 포지션 추정 개수", min_value=0, max_value=50, value=0, step=5)
-        reset_role_ratings = st.checkbox("역할별 레이팅을 Riot prior로 재초기화", value=False, help="이미 내전 기록을 반영한 뒤에는 보통 끄는 것이 좋습니다.")
-        if st.button("Riot API로 전체 갱신", use_container_width=True):
-            client = RiotClient(api_key=api_key.strip() or secret_or_env("RIOT_API_KEY", "") or None)
+        panel_start(
+            "Riot API 초기화",
+            "Riot ID 기준으로 솔랭/자유랭크, 최근 포지션, 라인별 Top 3 챔피언을 갱신합니다.",
+            tag="Riot",
+        )
+        api_key = env_value("RIOT_API_KEY", "").strip()
+        st.caption("API 키는 `.env`의 RIOT_API_KEY만 사용합니다. 입력창으로 받지 않습니다.")
+        infer_roles_count = st.slider("최근 매치 기반 선호 포지션 추정 개수", min_value=0, max_value=80, value=30, step=5)
+        champion_pool_count = st.slider("라인별 Top 3 챔피언 계산용 최근 매치 수", min_value=0, max_value=100, value=40, step=5)
+        solo_weight = st.slider("초기 점수에서 솔랭 반영 비중", min_value=0.0, max_value=1.0, value=0.75, step=0.05)
+        reset_role_ratings = st.checkbox(
+            "역할별 레이팅을 Riot prior로 재초기화",
+            value=True,
+            help="초기 세팅 시에는 켜는 것을 추천합니다. 이미 내전 기록을 충분히 쌓은 뒤에는 끄는 것이 좋습니다.",
+        )
+        if st.button("Riot API로 초기 점수/챔피언 갱신", use_container_width=True):
+            client = RiotClient(api_key=api_key or None)
             if not client.enabled:
-                st.error("RIOT_API_KEY가 필요합니다. 입력창에 넣거나 환경변수로 설정하세요.")
+                st.error(".env 파일에 RIOT_API_KEY가 필요합니다.")
             else:
                 with st.spinner("Riot API 갱신 중입니다. 플레이어 수와 최근 매치 개수에 따라 시간이 걸릴 수 있습니다."):
                     results = refresh_all_players_from_riot(
@@ -1815,19 +2222,25 @@ def page_import_sync(conn) -> None:
                         client,
                         reset_role_ratings=reset_role_ratings,
                         infer_roles_count=int(infer_roles_count),
+                        champion_pool_count=int(champion_pool_count),
+                        solo_weight=float(solo_weight),
                     )
                 df = pd.DataFrame([
                     {
                         "플레이어": r.player_name,
                         "상태": r.status,
                         "메시지": r.message,
-                        "티어": (f"{r.solo_tier or ''} {r.solo_rank or ''}".strip()),
-                        "LP": r.league_points,
+                        "솔랭": (f"{r.solo_tier or ''} {r.solo_rank or ''}".strip()),
+                        "솔랭 LP": r.league_points,
+                        "자유랭크": (f"{r.flex_tier or ''} {r.flex_rank or ''}".strip()),
+                        "자유랭크 LP": r.flex_league_points,
                         "추정 포지션": ", ".join(r.inferred_roles or []),
                     }
                     for r in results
                 ])
                 st.dataframe(df, use_container_width=True, hide_index=True)
+                st.session_state.pop("latest_candidate", None)
+                st.session_state.pop("candidate_list", None)
         panel_end()
 
     panel_start("과거 내전 CSV 리플레이", "승패, 팀 배정, 캐리/MVP, 라인 영향도를 시간순으로 반영합니다.", tag="Matches CSV")
@@ -1856,6 +2269,69 @@ def page_import_sync(conn) -> None:
         - 과거 matches import/replay는 기존 기록을 학습용으로 반영하지만, append 로그에 중복 기록하지 않습니다.
         """
     )
+    player_rows = export_players_rows(conn)
+    match_rows = export_matches_rows(conn)
+    dl_cols = st.columns(3)
+    with dl_cols[0]:
+        st.download_button(
+            "players.csv 다운로드",
+            data=_csv_download_bytes(
+                player_rows,
+                [
+                    "name", "display_name", "riot_game_name", "riot_tag_line",
+                    "solo_tier", "solo_rank", "league_points",
+                    "flex_tier", "flex_rank", "flex_league_points",
+                    "preferred_roles", "top_champions_json", *ROLES,
+                ],
+            ),
+            file_name="players.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with dl_cols[1]:
+        st.download_button(
+            "matches.csv 다운로드",
+            data=_csv_download_bytes(
+                match_rows,
+                [
+                    "played_at",
+                    "blue_win",
+                    "blue_score",
+                    "red_score",
+                    "blue_top",
+                    "blue_jg",
+                    "blue_mid",
+                    "blue_adc",
+                    "blue_sup",
+                    "red_top",
+                    "red_jg",
+                    "red_mid",
+                    "red_adc",
+                    "red_sup",
+                    "carry_players",
+                    "mvp_player",
+                    "lane_top",
+                    "lane_jg",
+                    "lane_mid",
+                    "lane_adc",
+                    "lane_sup",
+                    "notes",
+                ],
+            ),
+            file_name="matches.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with dl_cols[2]:
+        participant_path = getattr(conn, "participants_path", None)
+        if participant_path and Path(participant_path).exists():
+            st.download_button(
+                "match_participants.csv 다운로드",
+                data=Path(participant_path).read_bytes(),
+                file_name="match_participants.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
     if Path(DEFAULT_MATCH_LOG_PATH).exists():
         st.download_button(
             "match_results.csv 다운로드",

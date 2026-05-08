@@ -1,5 +1,25 @@
 # Inhouse Balancer
 
+## CSV-only mode
+
+The app now runs without PostgreSQL or SQLite by default. When `INHOUSE_STORAGE` is
+unset or set to `csv`, the source-of-truth files live under `data/csv/`:
+
+```text
+data/csv/players.csv
+data/csv/matches.csv
+data/csv/match_participants.csv
+```
+
+- `players.csv` stores player profile fields plus role ratings (`TOP/JG/MID/ADC/SUP`), games played, and confidence.
+- `matches.csv` stores saved match summaries and result metadata.
+- `match_participants.csv` stores per-player, per-role rating changes for match history.
+
+Use `Import / Riot Sync` to upload edited `players.csv/xlsx` or `matches.csv/xlsx`.
+The same page has download buttons for the current players, matches, participants,
+and append log CSV files. PostgreSQL is only used if you set `INHOUSE_STORAGE=postgres`
+and provide `DATABASE_URL`.
+
 League of Legends 5v5 내전 팀 밸런싱 도구입니다. 데모 데이터는 자동 생성되지 않으며, 사용자가 올린 `players.csv/xlsx`와 `matches.csv/xlsx`를 기준으로 초기 레이팅을 만들고 이후 경기 결과를 누적합니다.
 
 ## 주요 기능
@@ -139,4 +159,3 @@ inhouse-balancer-mvp/
 
 Team Builder의 플레이어 풀 위에 `TOP / JG / MID / ADC / SUP / 솔로랭크 / 이름` 정렬 버튼이 추가되었습니다.
 같은 버튼을 한 번 더 누르면 내림차순/오름차순이 전환됩니다. 기본적으로 라인 버튼은 해당 라인 점수가 높은 플레이어부터 표시합니다.
-

@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from .constants import LANE_IMPACT_LABELS, ROLES
 from .models import Player, TeamAssignment
 from .rating import initialize_role_ratings, tier_to_rating
-from .storage import create_player, delete_all_data, list_players, record_match_and_update
+from .storage import create_player, delete_all_data, list_players, record_match_and_update, update_match_played_at
 
 
 ROLE_ALIASES: dict[str, str] = {
@@ -477,8 +477,7 @@ def import_matches_csv(conn, csv_path: str | Path) -> ImportReport:
 
             played_at = _get(row, "played_at", "date", "일시")
             if played_at:
-                conn.execute("UPDATE matches SET played_at = ? WHERE id = ?", (played_at, int(match_id)))
-                conn.commit()
+                update_match_played_at(conn, int(match_id), played_at)
 
             report.imported += 1
         except Exception as exc:  # noqa: BLE001

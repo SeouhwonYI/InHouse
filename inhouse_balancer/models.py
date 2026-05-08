@@ -25,9 +25,13 @@ class Player:
     solo_tier: str = "UNRANKED"
     solo_rank: str = ""
     league_points: int = 0
+    flex_tier: str = "UNRANKED"
+    flex_rank: str = ""
+    flex_league_points: int = 0
     base_rating: float = 50.0
     preferred_roles: list[str] = field(default_factory=list)
     role_ratings: dict[str, RoleRating] = field(default_factory=dict)
+    lane_champions: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized: list[str] = []
@@ -42,6 +46,7 @@ class Player:
                 role,
                 RoleRating(role=role, rating=self.base_rating, games_played=0, confidence=0.45),
             )
+            self.lane_champions.setdefault(role, [])
 
     def rating_for(self, role: str) -> float:
         return float(self.role_ratings[role].rating)
@@ -85,6 +90,7 @@ class Player:
             "이름": self.label_name,
             "소환사": self.name,
             "솔로랭크": f"{self.solo_tier} {self.solo_rank}".strip(),
+            "자유랭크": f"{self.flex_tier} {self.flex_rank}".strip(),
             "선호": ", ".join(self.preferred_roles) or "-",
         }
         for role in ROLES:

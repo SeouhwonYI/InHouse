@@ -5,6 +5,7 @@ from collections.abc import Iterable
 
 from .constants import ROLES
 from .models import Player
+from .rating import tier_to_rating
 
 DEFAULT_POOL_SORT = "기본"
 NAME_POOL_SORT = "이름"
@@ -63,9 +64,7 @@ def sorted_players_for_pool(
         return sorted(
             items,
             key=lambda p: (
-                p.base_rating,
-                p.league_points,
-                (p.solo_tier or "").casefold(),
+                tier_to_rating(p.solo_tier, p.solo_rank, p.league_points),
                 (p.label_name or p.name).casefold(),
             ),
             reverse=descending,
